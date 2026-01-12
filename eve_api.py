@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+
 import httpx
 
 
@@ -18,11 +21,16 @@ class EveClient:
         Content-Type: application/x-www-form-urlencoded; charset=UTF-8
         Body: raw JSON string (NOT key=value form, NOT application/json)
         Header: X-Requested-With: XMLHttpRequest
+
     - Interface wiring MUST mimic legacy UI:
         PUT /api/labs/<lab>.unl/nodes/<id>/interfaces
         Content-Type: application/x-www-form-urlencoded; charset=UTF-8
         Body: raw JSON string like {"0":2}
         Header: X-Requested-With: XMLHttpRequest
+
+    Notes:
+    - Login works when sending raw JSON string via data=... without forcing Content-Type.
+    - Some EVE builds return HTML5 console URL only; telnet port is encoded in /client/<base64>.
     """
 
     base_url: str
@@ -35,7 +43,14 @@ class EveClient:
     _default_folder: Optional[str] = None
 
     def __post_init__(self) -> None:
-        self.base_url = self.base_url.rstrip("/")
+        if not self.base_url or not str(self.base_url).strip():
+            raise RuntimeError("EVE_BASE_URL is empty. Example: http://10.107.126.154")
+        if not self.username or not str(self.username).strip():
+            raise RuntimeError("EVE_USERNAME is empty.")
+        if not self.password or not str(self.password).strip():
+            raise RuntimeError("EVE_PASSWORD is empty.")
+
+        self.base_url = str(self.base_url).strip().rstrip("/")
         self._client = httpx.Client(base_url=self.base_url, timeout=30.0)
 
     # --------------------------
@@ -70,12 +85,7 @@ class EveClient:
 
     @staticmethod
     def _ui_headers(accept: bool = False) -> Dict[str, str]:
-        """
-        Headers that mimic the legacy EVE UI requests.
-        """
-        h: Dict[str, str] = {
-            "X-Requested-With": "XMLHttpRequest",
-        }
+        h: Dict[str, str] = {"X-Requested-With": "XMLHttpRequest"}
         if accept:
             h["Accept"] = "application/json, text/javascript, */*; q=0.01"
         return h
@@ -84,13 +94,20 @@ class EveClient:
     def _ui_post_content_type() -> Dict[str, str]:
         return {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
 
+    @staticmethod
+    def _host_from_base_url(base_url: str) -> str:
+        b = base_url.strip()
+        if "://" not in b:
+            b = "http://" + b
+        u = urlparse(b)
+        return u.netloc or u.path
+
     # --------------------------
     # Auth
     # --------------------------
     def login(self) -> None:
         assert self._client is not None
         payload = json.dumps({"username": self.username, "password": self.password})
-        # DO NOT force Content-Type; your box accepts raw JSON string here.
         resp = self._client.post("/api/auth/login", data=payload)
 
         if resp.status_code != 200:
@@ -143,7 +160,7 @@ class EveClient:
         return resp.json()
 
     # --------------------------
-    # Networks (IMPORTANT FIX)
+    # Networks (UI compatible)
     # --------------------------
     def add_network(
         self,
@@ -156,15 +173,6 @@ class EveClient:
         visibility: int = 1,
         icon: str = "01-Cloud-Default.svg",
     ) -> Dict[str, Any]:
-        """
-        UI-compatible network create.
-
-        Legacy UI request:
-          POST /api/labs/<lab>.unl/networks
-          Content-Type: application/x-www-form-urlencoded; charset=UTF-8
-          Body is RAW JSON STRING:
-            {"count":"1","visibility":"1","name":"Net-UI-1","type":"bridge","icon":"01-Cloud-Default.svg","left":"601","top":"373","postfix":0}
-        """
         assert self._client is not None
         lab_url = self._lab_url_path(lab_name, folder_path)
 
@@ -181,28 +189,22 @@ class EveClient:
 
         body_str = json.dumps(payload_obj, separators=(",", ":"))
 
-        headers = {}
+        headers: Dict[str, str] = {}
         headers.update(self._ui_headers(accept=True))
         headers.update(self._ui_post_content_type())
 
         resp = self._client.post(
             f"{lab_url}/networks",
             headers=headers,
-            data=body_str,   # raw JSON string body
+            data=body_str,
         )
         resp.raise_for_status()
         return resp.json()
 
     def list_networks(self, lab_name: str, folder_path: Optional[str] = None) -> Dict[str, Any]:
-        """
-        UI-compatible list networks (adds X-Requested-With + Accept like UI).
-        """
         assert self._client is not None
         lab_url = self._lab_url_path(lab_name, folder_path)
-        resp = self._client.get(
-            f"{lab_url}/networks",
-            headers=self._ui_headers(accept=True),
-        )
+        resp = self._client.get(f"{lab_url}/networks", headers=self._ui_headers(accept=True))
         resp.raise_for_status()
         return resp.json()
 
@@ -297,7 +299,7 @@ class EveClient:
         return None
 
     # --------------------------
-    # Wiring (IMPORTANT FIX)
+    # Wiring (UI compatible)
     # --------------------------
     def connect_node_interface_to_network(
         self,
@@ -308,13 +310,6 @@ class EveClient:
         folder_path: Optional[str] = None,
         media: str = "ethernet",
     ) -> Dict[str, Any]:
-        """
-        UI-compatible interface wiring.
-
-        PUT /api/labs/<lab>.unl/nodes/<id>/interfaces
-        Content-Type: application/x-www-form-urlencoded; charset=UTF-8
-        Body: raw JSON string like {"0":2}
-        """
         assert self._client is not None
         lab_url = self._lab_url_path(lab_name, folder_path)
 
@@ -328,7 +323,7 @@ class EveClient:
 
         body_str = json.dumps({str(idx): int(network_id)}, separators=(",", ":"))
 
-        headers = {}
+        headers: Dict[str, str] = {}
         headers.update(self._ui_headers(accept=False))
         headers.update(self._ui_post_content_type())
 
@@ -350,3 +345,79 @@ class EveClient:
         resp = self._client.get(f"{lab_url}/nodes/start", headers=headers)
         resp.raise_for_status()
         return resp.json()
+
+    # --------------------------
+    # Console helpers
+    # --------------------------
+    def get_node_detail(self, lab_name: str, node_id: str, folder_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Returns node detail JSON.
+        On your EVE, this includes:
+          console='telnet' (type) and url='/html5/#/client/<base64>?token=...'
+        """
+        assert self._client is not None
+        lab_url = self._lab_url_path(lab_name, folder_path)
+        resp = self._client.get(f"{lab_url}/nodes/{node_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_console_endpoint(self, lab_name: str, node_name: str, folder_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Returns telnet console endpoint for a node.
+        Output:
+          {"host": "<eve_ip>", "port": 32770, "node_id": "...", "node_name": "..."}
+        """
+        node_id = self.get_node_id_by_name(lab_name, node_name, folder_path)
+        if not node_id:
+            raise RuntimeError(f"Could not find node id for '{node_name}' in lab '{lab_name}'")
+
+        detail = self.get_node_detail(lab_name, node_id, folder_path).get("data", {}) or {}
+
+        port: Optional[int] = None
+
+        # 1) Some EVE versions provide direct numeric keys
+        for k in ("port", "console_port", "telnet_port", "tcp_port"):
+            v = detail.get(k)
+            if isinstance(v, int):
+                port = v
+                break
+            if isinstance(v, str) and v.strip().isdigit():
+                port = int(v.strip())
+                break
+
+        # 2) Sometimes console is numeric; on your EVE it's 'telnet'
+        if port is None:
+            v = detail.get("console")
+            if isinstance(v, int):
+                port = v
+            elif isinstance(v, str) and v.strip().isdigit():
+                port = int(v.strip())
+
+        # 3) Your case: decode /html5/#/client/<base64>?token=...
+        if port is None:
+            url = (detail.get("url") or "").strip()
+            m = re.search(r"/client/([^/?#]+)", url)
+            if m:
+                token = m.group(1)
+                try:
+                    decoded = base64.b64decode(token).decode("utf-8", errors="ignore")
+                    m2 = re.match(r"(\d+)", decoded)
+                    if m2:
+                        port = int(m2.group(1))
+                except Exception:
+                    port = None
+
+        if port is None:
+            raise RuntimeError(
+                f"Console port not found for node '{node_name}'. "
+                f"Node detail keys={sorted(detail.keys())}, detail={detail}"
+            )
+
+        host = self._host_from_base_url(self.base_url)
+
+        return {
+            "host": host,
+            "port": int(port),
+            "node_id": str(node_id),
+            "node_name": node_name,
+        }
